@@ -1,70 +1,124 @@
 # DocVerificator
 
-Python starter project for document checks on JPG/PNG/HEIC/PDF inputs, focused on:
+Document verification pipeline in Python for Arabic + English IDs/statements (JPG/PNG/HEIC/PDF).
 
-- OCR for Arabic + English documents
-- Field extraction (Civil ID, DOB, name)
-- Best-effort authenticity validation checks (format/checksum/consistency/fuzzy match)
+The system runs OCR, extracts key fields, validates consistency, and now saves each scan result as JSON under `output/`.
 
-## Why this design
+## What This Implementation Does
 
-This implementation uses your guidelines, with production-friendly defaults:
+- OCR engine support:
+- `paddle` (recommended for Arabic+English documents)
+- `easy` (fallback)
+- `auto` (tries Paddle first, then Easy)
+- Preprocessing:
+- denoise
+- contrast enhancement (CLAHE)
+- deskew with safety cap
+- Extraction:
+- Civil ID candidate scoring (not first regex hit)
+- DOB extraction + Civil ID-derived DOB fallback
+- name extraction heuristics
+- Validation:
+- Civil ID format + checksum (community-sourced algorithm)
+- DOB plausibility + consistency checks
+- optional fuzzy name matching
+- Persistence:
+- each CLI scan writes a timestamped JSON output file to `output/` (or custom folder via flag)
 
-- PaddleOCR first, EasyOCR fallback
-- OpenCV preprocessing (denoise, contrast, deskew)
-- Regex + heuristics extraction
-- Kuwait Civil ID validation:
-- 12-digit format
-- community-sourced checksum formula (not official PACI spec)
-- DOB plausibility and Civil ID vs DOB consistency
-- Fuzzy name matching via `rapidfuzz`
+## A-to-Z Flow
 
-Important: this is not a cryptographic authenticity verifier. It is a strong screening layer that reduces fraud risk, but cannot prove originality by itself.
+1. Input arrives via CLI (`--file`).
+2. File loader checks size/format and loads:
+- image directly, or
+- first PDF page rendered to image.
+3. Preprocessing runs (denoise/contrast/deskew).
+4. OCR backend is initialized (`paddle`, `easy`, or `auto`).
+5. OCR runs on preprocessed image.
+6. Retry logic can run OCR on original/rotated variants when key fields are missing.
+7. Field extraction runs:
+- Civil ID: labeled-context aware candidate scoring + checksum/DOB-aware ranking.
+- DOB: explicit date patterns first, Civil ID DOB fallback second.
+- Name: label-guided selection + heuristic fallback.
+8. Validation runs:
+- format/checksum/DOB checks
+- optional expected name/DOB comparison
+9. CLI prints JSON to terminal.
+10. Same JSON is saved to disk in `output/<inputname>_<timestamp>.json`.
 
-## Install
+## Project Structure
 
-```bash
+- `src/docverificator/input_loader.py`: file ingest (image/PDF/HEIC)
+- `src/docverificator/preprocessing.py`: image preprocessing
+- `src/docverificator/ocr_backends.py`: Paddle/Easy OCR adapters
+- `src/docverificator/extraction.py`: field extraction logic
+- `src/docverificator/validation.py`: authenticity-oriented checks
+- `src/docverificator/pipeline.py`: orchestrates full scan
+- `src/docverificator/cli.py`: CLI + output JSON persistence
+- `tests/`: unit and optional integration tests
+
+## Setup
+
+From project root:
+
+```powershell
 python -m venv .venv
-.venv\Scripts\activate
-pip install -e .[ocr-paddle,ocr-easy,heic,dev]
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
 ```
 
-If PaddleOCR installation is heavy for your environment, install EasyOCR first:
+If you use Paddle, verify:
 
-```bash
-pip install -e .[ocr-easy,heic,dev]
+```powershell
+python -c "import paddle, paddleocr; print('ok')"
 ```
 
 ## Run
 
-```bash
-docverificator --file path\to\document.jpg --expected-name "John Doe" --expected-dob 1995-04-12
+Basic:
+
+```powershell
+$env:PYTHONPATH="src"
+python -m docverificator.cli --file sample_data\Civil-ID.pdf --ocr-engine paddle
 ```
 
-Or:
+With expected values:
 
-```bash
-python -m docverificator.cli --file path\to\document.pdf --ocr-engine paddle
+```powershell
+python -m docverificator.cli `
+  --file sample_data\Civil-ID.pdf `
+  --ocr-engine paddle `
+  --expected-name "John Doe" `
+  --expected-dob 2003-09-16
 ```
 
-Output is JSON with extracted fields, validation decisions, OCR confidence, and warnings.
+Custom output directory:
 
-## Environment configuration
+```powershell
+python -m docverificator.cli --file sample_data\Civil-ID.pdf --output-dir scans
+```
 
-See `.env.example`:
+## Output Behavior
 
-- `OCR_ENGINE`: `auto`, `paddle`, `easy`
-- `PADDLE_LANG`: default `ar`
-- `EASYOCR_LANGS`: CSV, default `ar,en`
-- `LOW_CONF_THRESHOLD`: OCR retry threshold
-- `MAX_FILE_SIZE_MB`: upload guardrail
-- `PDF_DPI`: render quality for PDFs
-- `MIN_AGE` / `MAX_AGE`: DOB plausibility bounds
+- Terminal output: JSON result.
+- Saved output file: JSON file in `output/` by default.
+- Filename format: `<input_stem>_<YYYYMMDD_HHMMSS_microseconds>.json`.
+- Path is included in terminal JSON as `output_file`.
 
-## Next hardening steps
+## Config
 
-1. Add region detectors (ID number/name zones) and second-pass OCR on crops.
-2. Add anti-tamper signals (copy-move detection, JPEG artifact inconsistency, MRZ checks if available).
-3. Add official/partner verification integration when accessible.
-4. Add golden test fixtures for your real document templates.
+Environment variables (`.env.example`):
+
+- `OCR_ENGINE`, `PADDLE_LANG`, `EASYOCR_LANGS`
+- `LOW_CONF_THRESHOLD`, `MAX_FILE_SIZE_MB`, `PDF_DPI`
+- `MIN_AGE`, `MAX_AGE`
+- `RETRY_LOW_CONF_ON_ORIGINAL`
+- `RETRY_MISSING_KEY_FIELDS`
+- `TRY_ROTATIONS_ON_MISSING_FIELDS`
+- `MAX_DESKEW_ANGLE`
+
+## Notes
+
+- Checksum logic is best-effort (community reference), not official PACI publication.
+- This is a screening pipeline, not cryptographic proof of document authenticity.
 
