@@ -50,7 +50,7 @@ class ValidationTests(unittest.TestCase):
         self.assertGreaterEqual(score, 0.7)
 
     def test_validation_fails_when_no_key_fields_extracted(self) -> None:
-        fields = ExtractedFields(civil_id=None, date_of_birth=None, name=None)
+        fields = ExtractedFields(civil_id=None, birth_date=None, name=None)
         result = validate_fields(fields, Settings())
         self.assertFalse(result.overall_pass)
         self.assertTrue(any("No key fields" in warning for warning in result.warnings))

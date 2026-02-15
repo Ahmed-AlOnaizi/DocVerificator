@@ -16,8 +16,9 @@ The system runs OCR, extracts key fields, validates consistency, and now saves e
 - deskew with safety cap
 - Extraction:
 - Civil ID candidate scoring (not first regex hit)
-- DOB extraction + Civil ID-derived DOB fallback
-- name extraction heuristics
+- birth date extraction + Civil ID-derived birth date fallback
+- expiry date extraction (label-aware, then positional fallback)
+- name extraction anchored to `Name` labels (same line or next line)
 - Validation:
 - Civil ID format + checksum (community-sourced algorithm)
 - DOB plausibility + consistency checks
@@ -37,11 +38,12 @@ The system runs OCR, extracts key fields, validates consistency, and now saves e
 6. Retry logic can run OCR on original/rotated variants when key fields are missing.
 7. Field extraction runs:
 - Civil ID: labeled-context aware candidate scoring + checksum/DOB-aware ranking.
-- DOB: explicit date patterns first, Civil ID DOB fallback second.
+- Birth date: explicit date patterns first, Civil ID birth-date fallback second.
+- Expiry date: explicit/split-label patterns and compact fallback parsing.
 - Name: label-guided selection + heuristic fallback.
 8. Validation runs:
 - format/checksum/DOB checks
-- optional expected name/DOB comparison
+- optional expected name/birth-date comparison
 9. CLI prints JSON to terminal.
 10. Same JSON is saved to disk in `output/<inputname>_<timestamp>.json`.
 
@@ -104,6 +106,7 @@ python -m docverificator.cli --file sample_data\Civil-ID.pdf --output-dir scans
 - Saved output file: JSON file in `output/` by default.
 - Filename format: `<input_stem>_<YYYYMMDD_HHMMSS_microseconds>.json`.
 - Path is included in terminal JSON as `output_file`.
+- Extracted `birth_date` and `expiry_date` are emitted in `dd/mm/yyyy`.
 
 ## Config
 
@@ -121,4 +124,3 @@ Environment variables (`.env.example`):
 
 - Checksum logic is best-effort (community reference), not official PACI publication.
 - This is a screening pipeline, not cryptographic proof of document authenticity.
-

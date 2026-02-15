@@ -87,10 +87,12 @@ def extract_dob_from_civil_id(civil_id: str) -> date | None:
 def parse_iso_date(value: str | None) -> date | None:
     if not value:
         return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
-    except ValueError:
-        return None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def is_plausible_dob(value: date | None, min_age: int, max_age: int) -> bool | None:
@@ -110,7 +112,7 @@ def validate_fields(
     expected_dob: str | None = None,
 ) -> ValidationResult:
     out = ValidationResult()
-    no_key_fields = not (fields.civil_id or fields.date_of_birth or fields.name)
+    no_key_fields = not (fields.civil_id or fields.birth_date or fields.name)
     if no_key_fields:
         out.warnings.append("No key fields were extracted from OCR output.")
 
@@ -122,7 +124,7 @@ def validate_fields(
                 out.warnings.append("Civil ID checksum failed (community algorithm).")
 
             cid_dob = extract_dob_from_civil_id(fields.civil_id)
-            extracted_dob = parse_iso_date(fields.date_of_birth)
+            extracted_dob = parse_iso_date(fields.birth_date)
             expected_dob_parsed = parse_iso_date(expected_dob)
 
             if extracted_dob and cid_dob:
@@ -136,7 +138,7 @@ def validate_fields(
             out.civil_id_checksum_valid = False
             out.warnings.append("Civil ID format is invalid (must be 12 digits).")
 
-    dob_for_plausibility = parse_iso_date(fields.date_of_birth) or parse_iso_date(expected_dob)
+    dob_for_plausibility = parse_iso_date(fields.birth_date) or parse_iso_date(expected_dob)
     out.dob_plausible = is_plausible_dob(dob_for_plausibility, settings.min_age, settings.max_age)
     if out.dob_plausible is False:
         out.warnings.append("DOB failed plausibility checks.")

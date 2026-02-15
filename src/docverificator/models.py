@@ -21,7 +21,8 @@ class OCRResult:
 @dataclass(slots=True)
 class ExtractedFields:
     civil_id: str | None = None
-    date_of_birth: str | None = None
+    birth_date: str | None = None
+    expiry_date: str | None = None
     name: str | None = None
     doc_type_hint: str | None = None
     candidate_names: list[str] = field(default_factory=list)
@@ -45,10 +46,10 @@ class PipelineResult:
     extracted: ExtractedFields
     validation: ValidationResult
     ocr_engine: str
+    ocr_source: str
     ocr_mean_confidence: float
     preprocess_angle: float
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-

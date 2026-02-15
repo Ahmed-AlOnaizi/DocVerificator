@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date
 
 from .models import ExtractedFields, OCRResult
 
 _ARABIC_DIGITS = str.maketrans("\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669", "0123456789")
 _CIVIL_RE = re.compile(r"(?<!\d)\d{12}(?!\d)")
-_DOB_RE = re.compile(r"\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b")
-_DOB_COMPACT_RE = re.compile(r"(?<!\d)(\d{2})(\d{2})(\d{4})(?!\d)")
+_DATE_RE = re.compile(r"\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b")
+_DATE_COMPACT_RE = re.compile(r"(?<!\d)(\d{2})(\d{2})(\d{4})(?!\d)")
+_MRZ_DATE_PAIR_RE = re.compile(r"[A-Z]([0-9]{6})[A-Z]([0-9]{6})")
 
 _CIVIL_LABELS_EN = ("civil id", "civilid", "id number", "id no", "civil")
 _CIVIL_LABELS_AR = (
@@ -18,6 +20,11 @@ _CIVIL_LABELS_AR = (
 )
 _DOB_LABELS_EN = ("dob", "date of birth", "birth date", "birth")
 _DOB_LABELS_AR = ("\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0645\u064a\u0644\u0627\u062f", "\u0645\u064a\u0644\u0627\u062f")
+_EXPIRY_LABELS_EN = ("expiry", "expiry date", "expiration", "expiration date", "exp date", "valid until")
+_EXPIRY_LABELS_AR = (
+    "\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0627\u0646\u062a\u0647\u0627\u0621",
+    "\u0627\u0644\u0627\u0646\u062a\u0647\u0627\u0621",
+)
 
 _NAME_LABELS_EN = ("name", "full name", "customer name", "account holder")
 _NAME_LABELS_AR = (
@@ -28,6 +35,17 @@ _NAME_LABELS_AR = (
 )
 
 _CHECKSUM_WEIGHTS = (2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+
+
+@dataclass(slots=True)
+class _DateCandidate:
+    value: date
+    line_index: int
+    has_dob_label: bool
+    has_expiry_label: bool
+    direct_dob_label: bool
+    direct_expiry_label: bool
+    raw_text: str
 
 
 def normalize_digits(text: str) -> str:
@@ -54,18 +72,48 @@ def _normalize_for_digit_recovery(text: str) -> str:
     return recovered
 
 
-def _parse_dob(day_s: str, month_s: str, year_s: str) -> date | None:
+def _parse_date(day_s: str, month_s: str, year_s: str, *, allow_future: bool) -> date | None:
     day = int(day_s)
     month = int(month_s)
     year = int(year_s)
     if year < 100:
         year = 2000 + year if year <= (date.today().year % 100) else 1900 + year
-    if year < 1900 or year > date.today().year:
+    max_year = date.today().year + 30 if allow_future else date.today().year
+    if year < 1900 or year > max_year:
         return None
     try:
-        return date(year, month, day)
+        parsed = date(year, month, day)
     except ValueError:
         return None
+    if not allow_future and parsed > date.today():
+        return None
+    return parsed
+
+
+def _format_date_output(value: date) -> str:
+    return value.strftime("%d/%m/%Y")
+
+
+def _parse_yymmdd(token: str, *, allow_future: bool) -> date | None:
+    if not re.fullmatch(r"\d{6}", token):
+        return None
+    yy = int(token[0:2])
+    month = int(token[2:4])
+    day = int(token[4:6])
+
+    # Pivot near current year to map two-digit years.
+    current_yy = date.today().year % 100
+    year = 2000 + yy if yy <= current_yy + 15 else 1900 + yy
+    max_year = date.today().year + 30 if allow_future else date.today().year
+    if year < 1900 or year > max_year:
+        return None
+    try:
+        parsed = date(year, month, day)
+    except ValueError:
+        return None
+    if not allow_future and parsed > date.today():
+        return None
+    return parsed
 
 
 def _civil_checksum_valid(civil_id: str) -> bool:
@@ -109,7 +157,9 @@ def _has_civil_label(line: str) -> bool:
     compact = re.sub(r"\s+", "", lowered)
     if any(label in lowered for label in _CIVIL_LABELS_EN):
         return True
-    if "civilid" in compact or compact.startswith("id") or "idkwt" in compact:
+    if "civilid" in compact:
+        return True
+    if re.search(r"\bid(?:\s*no|\s*number|[:#])", lowered):
         return True
     return any(label in line for label in _CIVIL_LABELS_AR)
 
@@ -118,7 +168,36 @@ def _has_dob_label(line: str) -> bool:
     lowered = line.lower()
     if any(label in lowered for label in _DOB_LABELS_EN):
         return True
+    compact = re.sub(r"[^a-z]", "", lowered)
+    if "dateofbirth" in compact or "birthdate" in compact or "dob" in compact:
+        return True
     return any(label in line for label in _DOB_LABELS_AR)
+
+
+def _has_expiry_label(line: str) -> bool:
+    lowered = line.lower()
+    if any(label in lowered for label in _EXPIRY_LABELS_EN):
+        return True
+    compact = re.sub(r"[^a-z]", "", lowered)
+    if "expiry" in compact or "expiration" in compact or "validuntil" in compact or "validtill" in compact:
+        return True
+    if "date" in compact and any(tok in compact for tok in ("exp", "piy", "iry", "piry")):
+        return True
+    return any(label in line for label in _EXPIRY_LABELS_AR)
+
+
+def _has_label_in_context(lines: list[str], idx: int, checker: callable) -> bool:
+    if checker(lines[idx]):
+        return True
+    if idx > 0:
+        prev = lines[idx - 1]
+        if checker(prev + " " + lines[idx]):
+            return True
+    if idx + 1 < len(lines):
+        nxt = lines[idx + 1]
+        if checker(lines[idx] + " " + nxt):
+            return True
+    return False
 
 
 def _candidate_score(civil_id: str, line: str, labeled_context: bool, from_window: bool) -> float:
@@ -161,6 +240,22 @@ def _push_candidate(
         scoreboard[candidate] = score
 
 
+def _push_candidate_with_bonus(
+    scoreboard: dict[str, float],
+    candidate: str,
+    line: str,
+    labeled_context: bool,
+    from_window: bool,
+    bonus: float,
+) -> None:
+    if not re.fullmatch(r"\d{12}", candidate):
+        return
+    score = _candidate_score(candidate, line=line, labeled_context=labeled_context, from_window=from_window) + bonus
+    current = scoreboard.get(candidate)
+    if current is None or score > current:
+        scoreboard[candidate] = score
+
+
 def _collect_line_candidates(line: str) -> list[tuple[str, bool]]:
     out: list[tuple[str, bool]] = []
     normalized = _normalize_for_digit_recovery(normalize_digits(line))
@@ -180,6 +275,38 @@ def _collect_line_candidates(line: str) -> list[tuple[str, bool]]:
 def _pick_civil_id(lines: list[str]) -> str | None:
     if not lines:
         return None
+
+    # First pass: candidates around explicit Civil ID labels.
+    labeled_scoreboard: dict[str, float] = {}
+    for idx, line in enumerate(lines):
+        if not _has_civil_label(line):
+            continue
+        for j in range(idx, min(idx + 3, len(lines))):
+            normalized = _normalize_for_digit_recovery(normalize_digits(lines[j]))
+            for candidate, from_window in _collect_line_candidates(normalized):
+                _push_candidate_with_bonus(
+                    labeled_scoreboard,
+                    candidate,
+                    line=lines[j],
+                    labeled_context=True,
+                    from_window=from_window,
+                    bonus=2.0,
+                )
+            # For long merged strings near label, the right-most 12 digits usually represent Civil ID.
+            for seq in re.findall(r"\d{13,}", normalized):
+                tail = seq[-12:]
+                _push_candidate_with_bonus(
+                    labeled_scoreboard,
+                    tail,
+                    line=lines[j],
+                    labeled_context=True,
+                    from_window=True,
+                    bonus=7.5,
+                )
+
+    if labeled_scoreboard:
+        best_labeled = max(labeled_scoreboard.items(), key=lambda item: item[1])[0]
+        return best_labeled
 
     scoreboard: dict[str, float] = {}
 
@@ -231,59 +358,230 @@ def _pick_civil_id(lines: list[str]) -> str | None:
     return best
 
 
-def _pick_dob(lines: list[str], full_text: str, civil_id: str | None) -> str | None:
-    normalized_text = normalize_digits(full_text)
+def _collect_date_candidates(lines: list[str]) -> list[_DateCandidate]:
+    out: list[_DateCandidate] = []
+    for idx, raw in enumerate(lines):
+        line = normalize_digits(raw)
+        direct_dob_label = _has_dob_label(line)
+        direct_expiry_label = _has_expiry_label(line)
+        has_dob_label = _has_label_in_context(lines, idx, _has_dob_label)
+        has_expiry_label = _has_label_in_context(lines, idx, _has_expiry_label)
 
-    for day_s, month_s, year_s in _DOB_RE.findall(normalized_text):
-        dt = _parse_dob(day_s, month_s, year_s)
-        if dt:
-            return dt.isoformat()
+        for match in _DATE_RE.finditer(line):
+            day_s, month_s, year_s = match.groups()
+            dt = _parse_date(day_s, month_s, year_s, allow_future=True)
+            if dt:
+                out.append(
+                    _DateCandidate(
+                        dt,
+                        idx,
+                        has_dob_label,
+                        has_expiry_label,
+                        direct_dob_label,
+                        direct_expiry_label,
+                        match.group(0),
+                    )
+                )
 
-    for line in lines:
-        if not _has_dob_label(line):
-            continue
-        normalized_line = normalize_digits(line)
-        for day_s, month_s, year_s in _DOB_RE.findall(normalized_line):
-            dt = _parse_dob(day_s, month_s, year_s)
-            if dt:
-                return dt.isoformat()
-        compact = re.sub(r"\D", "", normalized_line)
-        for day_s, month_s, year_s in _DOB_COMPACT_RE.findall(compact):
-            dt = _parse_dob(day_s, month_s, year_s)
-            if dt:
-                return dt.isoformat()
+        # Compact pattern is noisy; use it only on labeled lines.
+        if has_dob_label or has_expiry_label:
+            compact = re.sub(r"\D", "", line)
+            for match in _DATE_COMPACT_RE.finditer(compact):
+                day_s, month_s, year_s = match.groups()
+                dt = _parse_date(day_s, month_s, year_s, allow_future=True)
+                if dt:
+                    out.append(
+                        _DateCandidate(
+                            dt,
+                            idx,
+                            has_dob_label,
+                            has_expiry_label,
+                            direct_dob_label,
+                            direct_expiry_label,
+                            match.group(0),
+                        )
+                    )
+    return out
+
+
+def _pick_dob_and_expiry(lines: list[str], civil_id: str | None) -> tuple[str | None, str | None]:
+    candidates = _collect_date_candidates(lines)
+
+    dob_date: date | None = None
+    dob_line_index: int | None = None
 
     if civil_id:
         cid_dob = _civil_id_to_dob(civil_id)
         if cid_dob:
-            return cid_dob.isoformat()
+            dob_date = cid_dob
+            for c in candidates:
+                if c.value == cid_dob:
+                    dob_line_index = c.line_index
+                    break
 
-    return None
+    if dob_date is None:
+        direct_labeled_dob = [c for c in candidates if c.direct_dob_label and _dob_plausible(c.value)]
+        if direct_labeled_dob:
+            chosen = direct_labeled_dob[0]
+            dob_date, dob_line_index = chosen.value, chosen.line_index
+        else:
+            labeled_dob = [c for c in candidates if c.has_dob_label and _dob_plausible(c.value)]
+            if labeled_dob:
+                chosen = labeled_dob[0]
+                dob_date, dob_line_index = chosen.value, chosen.line_index
+            else:
+                generic = [c for c in candidates if _dob_plausible(c.value)]
+                if generic:
+                    chosen = generic[0]
+                    dob_date, dob_line_index = chosen.value, chosen.line_index
+
+    def pick_expiry_value(pool: list[_DateCandidate]) -> date | None:
+        if not pool:
+            return None
+        # For IDs, expiry should be after birth when birth is known.
+        if dob_date is not None:
+            after_birth = [c for c in pool if c.value > dob_date]
+            if after_birth:
+                return max(after_birth, key=lambda c: (c.value, c.line_index)).value
+            not_same = [c for c in pool if c.value != dob_date]
+            if not_same:
+                return max(not_same, key=lambda c: (c.value, c.line_index)).value
+        return max(pool, key=lambda c: (c.value, c.line_index)).value
+
+    expiry_date: date | None = None
+    direct_labeled_expiry = [c for c in candidates if c.direct_expiry_label]
+    expiry_date = pick_expiry_value(direct_labeled_expiry)
+
+    if expiry_date is None:
+        labeled_expiry = [c for c in candidates if c.has_expiry_label]
+        expiry_date = pick_expiry_value(labeled_expiry)
+
+    if expiry_date is None and dob_date is not None:
+        post_dob = [
+            c for c in candidates if c.value > dob_date and (dob_line_index is None or c.line_index >= dob_line_index)
+        ]
+        expiry_date = pick_expiry_value(post_dob)
+
+    if expiry_date is None and dob_date is not None:
+        post_dob_anywhere = [c for c in candidates if c.value > dob_date]
+        expiry_date = pick_expiry_value(post_dob_anywhere)
+
+    if expiry_date is None and candidates:
+        # Resilient fallback: choose the latest visible date.
+        expiry_date = max((c.value for c in candidates), default=None)
+
+    if expiry_date is None:
+        # Fallback for compact MRZ-like OCR lines, e.g. "...D309161M220916..."
+        for raw in lines:
+            normalized = _normalize_for_digit_recovery(normalize_digits(raw)).upper()
+            for dob6, exp6 in _MRZ_DATE_PAIR_RE.findall(normalized):
+                mrz_dob = _parse_yymmdd(dob6, allow_future=False)
+                mrz_exp = _parse_yymmdd(exp6, allow_future=True)
+
+                if dob_date is None and mrz_dob and _dob_plausible(mrz_dob):
+                    dob_date = mrz_dob
+                    dob_line_index = 0
+
+                if mrz_exp and (dob_date is None or mrz_exp > dob_date):
+                    expiry_date = mrz_exp
+                    break
+            if expiry_date is not None:
+                break
+
+    birth_out = _format_date_output(dob_date) if dob_date else None
+    expiry_out = _format_date_output(expiry_date) if expiry_date else None
+    return birth_out, expiry_out
 
 
 def _label_extract_name(lines: list[str]) -> list[str]:
     candidates: list[str] = []
-    for line in lines:
+
+    def looks_like_non_name_label(value: str) -> bool:
+        lowered = value.lower()
+        compact = re.sub(r"[^a-z]", "", lowered)
+        return any(
+            token in compact
+            for token in (
+                "birthdate",
+                "dateofbirth",
+                "dob",
+                "expiry",
+                "expiration",
+                "civilid",
+                "civilnumber",
+                "idnumber",
+                "serial",
+            )
+        )
+
+    def clean_name_value(value: str) -> str:
+        value = value.strip(": -\t")
+        value = re.sub(r"\s+", " ", value).strip()
+        return value
+
+    def clean_name_tokens(value: str) -> str:
+        parts = [part for part in re.split(r"\s+", value) if part]
+        if len(parts) < 2:
+            return ""
+        cleaned: list[str] = []
+        for part in parts:
+            token = re.sub(r"[^A-Za-z\u0600-\u06FF]", "", part)
+            if not token:
+                continue
+            cleaned.append(token)
+        return " ".join(cleaned).strip()
+
+    def has_name_label(line: str) -> bool:
         lowered = line.lower()
-        has_en_label = any(label in lowered for label in _NAME_LABELS_EN)
-        has_ar_label = any(label in line for label in _NAME_LABELS_AR)
-        if not (has_en_label or has_ar_label):
+        return any(label in lowered for label in _NAME_LABELS_EN) or any(label in line for label in _NAME_LABELS_AR)
+
+    # First pass: strictly same-line value after "Name".
+    for idx, line in enumerate(lines):
+        if not has_name_label(line):
             continue
 
         value = line
-        for label in _NAME_LABELS_EN:
-            value = re.sub(label, "", value, flags=re.IGNORECASE)
+        lowered = line.lower()
+        used_en_label = False
+        for label in sorted(_NAME_LABELS_EN, key=len, reverse=True):
+            pos = lowered.find(label)
+            if pos != -1:
+                value = line[pos + len(label) :]
+                used_en_label = True
+                break
+        if not used_en_label:
+            for label in _NAME_LABELS_EN:
+                value = re.sub(label, "", value, flags=re.IGNORECASE)
         for label in _NAME_LABELS_AR:
             value = value.replace(label, "")
-
-        value = value.strip(": -\t")
-        if value:
+        value = clean_name_tokens(clean_name_value(value))
+        if value and not looks_like_non_name_label(value) and _name_score(value) > 0.6:
             candidates.append(value)
+    if candidates:
+        return candidates
+
+    # Second pass fallback: next line after name label.
+    for idx, line in enumerate(lines):
+        if not has_name_label(line):
+            continue
+        # If the label line has no usable value, the next line often holds the full name.
+        for j in range(idx + 1, min(idx + 3, len(lines))):
+            nxt = clean_name_tokens(clean_name_value(lines[j]))
+            if has_name_label(nxt):
+                continue
+            if looks_like_non_name_label(nxt):
+                continue
+            if _name_score(nxt) > 0.75:
+                candidates.append(nxt)
+                break
     return candidates
 
 
 def _name_score(line: str) -> float:
     if len(line) < 3:
+        return -1.0
+    lowered = line.lower()
+    if any(token in lowered for token in ("birth", "dob", "expiry", "expiration", "civil id", "serial", "date")):
         return -1.0
     alpha = sum(1 for ch in line if ch.isalpha())
     digits = sum(1 for ch in line if ch.isdigit())
@@ -327,12 +625,13 @@ def extract_fields(ocr_result: OCRResult) -> ExtractedFields:
     full_text = "\n".join(lines) if lines else _clean_line(ocr_result.full_text)
 
     civil_id = _pick_civil_id(lines)
-    dob = _pick_dob(lines, full_text=full_text, civil_id=civil_id)
+    birth_date, expiry = _pick_dob_and_expiry(lines, civil_id=civil_id)
     name, candidates = _pick_name(lines)
 
     return ExtractedFields(
         civil_id=civil_id,
-        date_of_birth=dob,
+        birth_date=birth_date,
+        expiry_date=expiry,
         name=name,
         doc_type_hint=_doc_hint(full_text),
         candidate_names=candidates,

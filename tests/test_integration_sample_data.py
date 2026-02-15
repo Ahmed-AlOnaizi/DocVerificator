@@ -31,9 +31,8 @@ class SampleCivilIDIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual(result.extracted.civil_id, "303091600084")
-        self.assertEqual(result.extracted.date_of_birth, "2003-09-16")
+        self.assertEqual(result.extracted.birth_date, "16/09/2003")
 
 
 if __name__ == "__main__":
     unittest.main()
-
